@@ -1,0 +1,1 @@
+# HexCorruptor — filesystem parsers package
