@@ -2,6 +2,7 @@ import type {
   DeletedFilePreview,
   DeletedFileSummary,
   DeletedFilesResponse,
+  DeletedTraceTreeResponse,
   DevicesResponse,
   DirectoryResponse,
   FileDossier,
@@ -104,6 +105,19 @@ export const api = {
   forensicArtifacts: (query: string, limit = 100, cursorBlock = 0) =>
     request<ForensicArtifactsResponse>(
       `/api/forensics/artifacts?query=${encodeURIComponent(query)}&limit=${limit}&cursor_block=${cursorBlock}`,
+    ),
+  deletedTraceTree: (
+    options: { query?: string; limit?: number; cursorBlock?: number; scanBlocks?: number } & Abortable = {},
+  ) =>
+    request<DeletedTraceTreeResponse>(
+      `/api/forensics/deleted-tree${params({
+        query: options.query,
+        limit: options.limit ?? 150,
+        cursor_block: options.cursorBlock,
+        scan_blocks: options.scanBlocks,
+        cancel_token: options.cancelToken,
+      })}`,
+      { signal: options.signal },
     ),
   forensicSearch: (
     query: string,

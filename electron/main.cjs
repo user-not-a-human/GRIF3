@@ -14,7 +14,7 @@ function startApi() {
 
   apiProcess.on("exit", (code) => {
     if (code !== 0 && code !== null) {
-      console.error(`HexCorruptor API exited with code ${code}`);
+      console.error(`ГРИФ API exited with code ${code}`);
     }
   });
 }
@@ -25,7 +25,7 @@ function createWindow() {
     height: 900,
     minWidth: 1100,
     minHeight: 720,
-    title: "GRIF",
+    title: "ГРИФ",
     backgroundColor: "#171713",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),

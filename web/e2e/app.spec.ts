@@ -8,12 +8,19 @@ test("открывает демонстрационный образ и пров
   await openDemoImage(page);
   await page.goto("/");
 
-  await expect(page.getByText("HexCorruptor").first()).toBeVisible();
+  await expect(page.getByText("ГРИФ").first()).toBeVisible();
 
   await expect(page.getByLabel("Сводка источника").getByText("ext4", { exact: true })).toBeVisible();
   await expect(page.getByText("demo_ext4")).toBeVisible();
 
-  await page.getByRole("button", { name: "Байты" }).click();
+  await page.getByRole("button", { name: "ФС" }).click();
+  const activeFile = page.getByRole("button", { name: /active_demo\.txt/ });
+  await expect(activeFile).toBeVisible();
+  await activeFile.click();
+  await expect(page.getByText("Инод #12")).toBeVisible();
+  await expect(page.getByLabel("Смещение")).not.toHaveValue("0");
+
+  await page.getByRole("button", { name: "Редактор" }).click();
   await page.getByLabel("Смещение").fill("0");
   await page.getByRole("button", { name: "Перейти к смещению" }).click();
   await page.getByTitle("0x00000000 = 00").click();
@@ -48,7 +55,7 @@ test("открывает демонстрационный образ и пров
 test("ищет следы, открывает карточку и скачивает файлы", async ({ page }) => {
   await openDemoImage(page);
   await page.goto("/");
-  await page.getByRole("button", { name: "Следы" }).click();
+  await page.getByRole("button", { name: "Анализ" }).click();
 
   await page.getByRole("button", { name: "Найти" }).click();
   const recoverableRow = page.locator(".deleted-table", { hasText: "#13" }).first();

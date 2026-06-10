@@ -336,6 +336,31 @@ class TestExt4DeletedFilesForensics(unittest.TestCase):
         finally:
             session.close()
 
+    def test_demo_directory_entries_include_metadata_and_first_block(self):
+        from web_backend import HexCorruptorSession, _create_demo_image
+
+        demo_path = _create_demo_image()
+        session = HexCorruptorSession()
+        try:
+            session.open_source(demo_path)
+            status = session.status()
+            self.assertEqual(status["capabilities"]["navigation"], "full")
+            self.assertFalse(status["safety"]["isDevicePath"])
+            directory = session.directory(2)
+            entries = {entry["name"]: entry for entry in directory["entries"]}
+            self.assertIn("active_demo.txt", entries)
+            active = entries["active_demo.txt"]
+            self.assertEqual(active["inode"], 12)
+            self.assertEqual(active["size"], len(b"ACTIVE_DEMO_FILE"))
+            self.assertEqual(active["sizeHuman"], "16 B")
+            self.assertEqual(active["links"], 1)
+            self.assertEqual(active["firstBlock"], 92)
+            self.assertEqual(active["firstBlockOffset"], 92 * 1024)
+            self.assertIn("isDirectory", active)
+        finally:
+            session.close()
+            os.unlink(demo_path)
+
     def test_directory_artifacts_find_wiped_inode_names(self):
         artifacts = self.parser.scan_directory_artifacts(limit=10, name_hint="secret")
         names = {item["name"]: item for item in artifacts["items"]}

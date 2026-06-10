@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HTTP bridge for the React/Electron HexCorruptor interface.
+HTTP bridge for the React/Electron ГРИФ interface.
 
 The server intentionally reuses the existing Python core:
 DiskReader, filesystem parsers, and CommandHistory. The browser UI can run
@@ -43,6 +43,7 @@ CAPTURE_CHUNK_SIZE = 8 * 1024 * 1024
 
 CAPTURE_JOBS: dict[str, dict[str, Any]] = {}
 CAPTURE_LOCK = threading.Lock()
+IMAGE_METADATA_DIR = Path("/tmp/grif-images") if Path("/tmp").exists() else Path(tempfile.gettempdir()) / "grif-images"
 FORENSIC_CANCEL_EVENTS: dict[str, threading.Event] = {}
 FORENSIC_CANCEL_LOCK = threading.Lock()
 
@@ -221,15 +222,49 @@ def _field_by_name(structure: ParsedStructure, name: str) -> Any:
     return None
 
 
-def _entry_to_json(entry: DirEntry) -> dict[str, Any]:
-    return {
+def _entry_to_json(entry: DirEntry, parser: Any | None = None) -> dict[str, Any]:
+    result = {
         "name": entry.name,
         "inode": entry.inode,
         "fileType": _file_type_name(entry),
         "diskOffset": entry.disk_offset,
         "recordLength": entry.rec_len,
         "isDirectory": _file_type_name(entry) == "directory",
+        "size": None,
+        "sizeHuman": None,
+        "mode": None,
+        "links": None,
+        "firstBlock": None,
+        "firstBlockOffset": None,
     }
+    if parser is None:
+        return result
+    try:
+        meta = parser.get_inode_meta(entry.inode)
+        result.update({
+            "size": meta.size,
+            "sizeHuman": format_size(meta.size),
+            "mode": f"0o{meta.mode:06o} ({format_mode(meta.mode)})",
+            "links": meta.links,
+        })
+    except Exception:
+        pass
+    try:
+        blocks = parser._get_data_blocks(entry.inode)
+        if blocks:
+            block_size = 4096
+            try:
+                sb = parser._read_superblock_raw()
+                block_size = int(sb.get("block_size") or sb.get("sb_blocksize") or sb.get("sectorsize") or 4096)
+            except Exception:
+                pass
+            first_block = int(blocks[0])
+            partition_offset = int(getattr(parser, "partition_offset", 0))
+            result["firstBlock"] = first_block
+            result["firstBlockOffset"] = partition_offset + first_block * block_size
+    except Exception:
+        pass
+    return result
 
 
 class HexCorruptorSession:
@@ -240,6 +275,7 @@ class HexCorruptorSession:
         self.path: str | None = None
         self.mode = "closed"
         self.opened_at: float | None = None
+        self.image_identity: dict[str, Any] | None = None
 
     def close(self) -> None:
         if self.reader is not None:
@@ -250,6 +286,65 @@ class HexCorruptorSession:
         self.path = None
         self.mode = "closed"
         self.opened_at = None
+        self.image_identity = None
+
+    def _build_image_identity(self) -> dict[str, Any] | None:
+        if self.reader is None or self.path is None:
+            return None
+        path = self.path
+        name = os.path.basename(path.rstrip(os.sep)) or path.replace(os.sep, "_")
+        try:
+            stat_result = os.stat(path)
+            stat_payload = {
+                "device": stat_result.st_dev,
+                "inode": stat_result.st_ino,
+                "mode": stat_result.st_mode,
+                "mtimeNs": getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000)),
+                "ctimeNs": getattr(stat_result, "st_ctime_ns", int(stat_result.st_ctime * 1_000_000_000)),
+            }
+        except OSError:
+            stat_payload = {
+                "device": None,
+                "inode": None,
+                "mode": None,
+                "mtimeNs": None,
+                "ctimeNs": None,
+            }
+        fs_info: dict[str, Any] = {}
+        if self.parser is not None:
+            try:
+                fs_info = self.parser.get_fs_info()
+            except Exception:
+                fs_info = {}
+        identity_seed = {
+            "path": os.path.abspath(path) if not path.startswith("/dev/") else path,
+            "name": name,
+            "size": self.reader.size,
+            "isBlockDevice": self.reader.is_block_device,
+            "filesystem": self.parser.fs_name() if self.parser else None,
+            "filesystemUuid": fs_info.get("UUID"),
+            **stat_payload,
+        }
+        key = hashlib.sha256(json.dumps(identity_seed, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:24]
+        safe_name = "".join(char if char.isalnum() or char in "._-" else "_" for char in name)[:80] or "image"
+        IMAGE_METADATA_DIR.mkdir(parents=True, exist_ok=True)
+        metadata_path = IMAGE_METADATA_DIR / f"{safe_name}-{key}.json"
+        payload = {
+            "key": key,
+            "name": name,
+            "path": path,
+            "size": self.reader.size,
+            "sizeHuman": format_size(self.reader.size),
+            "isBlockDevice": self.reader.is_block_device,
+            "filesystem": self.parser.fs_name() if self.parser else None,
+            "filesystemUuid": fs_info.get("UUID"),
+            "openedAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "metadataPath": str(metadata_path),
+            "stat": stat_payload,
+            "identitySeed": identity_seed,
+        }
+        metadata_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return payload
 
     def open_source(self, path: str, writable: bool = False) -> dict[str, Any]:
         self.close()
@@ -270,6 +365,7 @@ class HexCorruptorSession:
         self.path = path
         self.mode = "read" if read_only else "read-write"
         self.opened_at = time.time()
+        self.image_identity = self._build_image_identity()
         return self.status()
 
     def ensure_reader(self) -> DiskReader:
@@ -302,6 +398,8 @@ class HexCorruptorSession:
                 "canRedo": False,
                 "history": [],
                 "capabilities": self.filesystem_capabilities(),
+                "safety": self.source_safety(),
+                "imageIdentity": None,
             }
 
         fs_info: dict[str, str] = {}
@@ -358,11 +456,22 @@ class HexCorruptorSession:
             "canRedo": self.history.can_redo(),
             "history": self.history.get_history(),
             "capabilities": self.filesystem_capabilities(),
+            "safety": self.source_safety(),
+            "imageIdentity": self.image_identity,
         }
 
     def filesystem_capabilities(self) -> dict[str, Any]:
         fs_name = self.parser.fs_name() if self.parser else None
+        if fs_name == "ext4":
+            navigation = "full"
+        elif fs_name in {"XFS", "Btrfs"}:
+            navigation = "partial"
+        elif self.parser:
+            navigation = "metadata"
+        else:
+            navigation = "metadata"
         raw = {
+            "navigation": navigation,
             "metadata": bool(self.parser),
             "timeline": bool(self.parser),
             "rawSearch": self.reader is not None,
@@ -376,6 +485,24 @@ class HexCorruptorSession:
         if fs_name in {"NTFS", "exFAT", "FAT", "FAT32", "FAT16", "FAT12"}:
             notes.append("Базовый парсер: доступен поиск по байтам, хронология ограничена")
         return {"filesystem": fs_name, **raw, "notes": notes}
+
+    def source_safety(self) -> dict[str, Any]:
+        path = self.path or ""
+        is_device_path = path.startswith("/dev/")
+        is_linux_device = platform.system() == "Linux" and is_device_path
+        mountpoints: list[str] = []
+        if is_linux_device:
+            for device in self._list_linux_devices():
+                if device.get("path") == path:
+                    mountpoints = list(device.get("mountpoints") or [])
+                    break
+        return {
+            "isDevicePath": is_device_path,
+            "isLinuxDevice": is_linux_device,
+            "mountpoints": mountpoints,
+            "isMounted": bool(mountpoints),
+            "writeRequiresConfirmation": is_device_path and self.mode == "read-write",
+        }
 
     def read(self, offset: int, length: int) -> dict[str, Any]:
         reader = self.ensure_reader()
@@ -410,7 +537,7 @@ class HexCorruptorSession:
     def directory(self, inode: int) -> dict[str, Any]:
         parser = self.ensure_parser()
         entries = parser.list_directory(inode)
-        return {"inode": inode, "entries": [_entry_to_json(entry) for entry in entries]}
+        return {"inode": inode, "entries": [_entry_to_json(entry, parser) for entry in entries]}
 
     def search(self, pattern: bytes, start: int = 0) -> dict[str, Any]:
         reader = self.ensure_reader()
@@ -534,7 +661,7 @@ class HexCorruptorSession:
         ]
         warning_lines = [f"- {warning}" for warning in warnings] or ["- нет"]
         return "\n".join([
-            f"# Отчёт HexCorruptor по удалённому файлу: inode #{inode}",
+            f"# Отчёт ГРИФ по удалённому файлу: inode #{inode}",
             "",
             "Восстановление best-effort; имя и исходный путь не доказаны без directory/journal анализа.",
             "",
@@ -1073,6 +1200,143 @@ class HexCorruptorSession:
             "capabilities": self.filesystem_capabilities(),
         }
 
+    def deleted_trace_tree(self, query: str = "", limit: int = 150,
+                           cursor_block: int = 0,
+                           scan_blocks: int = 50_000,
+                           cancel_token: str | None = None) -> dict[str, Any]:
+        cancel_event = _cancel_event(cancel_token)
+        _check_cancel(cancel_event)
+        parser = self.ensure_parser()
+        if parser.fs_name() != "ext4":
+            return {
+                "query": query,
+                "items": [],
+                "roots": [],
+                "cursorBlock": cursor_block,
+                "nextCursorBlock": None,
+                "scannedBlocks": 0,
+                "totalBlocks": 0,
+                "truncated": False,
+                "capabilities": self.filesystem_capabilities(),
+                "notes": ["Удалённые следы в дереве сейчас доступны только для ext4"],
+            }
+
+        query_text = query.strip()
+        safe_limit = max(1, min(int(limit), 300))
+        if query_text:
+            artifacts = self.forensic_artifacts(
+                query_text,
+                limit=safe_limit,
+                cursor_block=cursor_block,
+                include_raw=True,
+                raw_limit=20,
+                cancel_token=cancel_token,
+            )
+            directory_entries = artifacts.get("directoryEntries", {})
+        else:
+            directory_entries = parser.scan_directory_artifacts(
+                limit=safe_limit,
+                cursor_block=cursor_block,
+                name_hint=None,
+                max_blocks=max(1, min(int(scan_blocks), 200_000)),
+                cancel_check=lambda: _check_cancel(cancel_event),
+            )
+
+        seen: set[tuple[int, int, str]] = set()
+        items: list[dict[str, Any]] = []
+        for item in directory_entries.get("items", []):
+            state = str((item.get("inodeState") or {}).get("state") or "")
+            if state == "active":
+                continue
+            try:
+                inode = int(item.get("inode", 0))
+                disk_offset = int(item.get("diskOffset", -1))
+            except Exception:
+                continue
+            name = str(item.get("name") or "")
+            if not name or name in {".", ".."}:
+                continue
+            key = (disk_offset, inode, name)
+            if key in seen:
+                continue
+            seen.add(key)
+            enriched = dict(item)
+            enriched.setdefault("dataOffset", None)
+            enriched.setdefault("recoverability", None)
+            enriched.setdefault("recoverableBytes", 0)
+            enriched.setdefault("extentSummary", None)
+            if bool((item.get("inodeState") or {}).get("recoverable")):
+                try:
+                    deleted = parser.get_deleted_file(inode)
+                    extents = deleted.get("extents") or []
+                    enriched["dataOffset"] = extents[0].get("blockStart") if extents else None
+                    enriched["recoverability"] = deleted.get("recoverability")
+                    enriched["recoverableBytes"] = deleted.get("recoverableBytes", 0)
+                    enriched["extentSummary"] = deleted.get("extentSummary")
+                except Exception:
+                    pass
+            items.append(enriched)
+
+        nodes_by_id: dict[str, dict[str, Any]] = {}
+        directory_node_by_inode: dict[int, str] = {}
+        for item in items:
+            node_id = f"{item.get('diskOffset')}:{item.get('inode')}:{item.get('name')}"
+            node = {
+                "id": node_id,
+                "name": item.get("name"),
+                "path": item.get("pathHint") or item.get("name"),
+                "inode": item.get("inode"),
+                "fileType": item.get("fileType"),
+                "state": (item.get("inodeState") or {}).get("state"),
+                "item": item,
+                "children": [],
+            }
+            nodes_by_id[node_id] = node
+            if item.get("fileType") == "directory":
+                try:
+                    directory_node_by_inode.setdefault(int(item.get("inode")), node_id)
+                except Exception:
+                    pass
+
+        roots: list[dict[str, Any]] = []
+        for item in items:
+            node_id = f"{item.get('diskOffset')}:{item.get('inode')}:{item.get('name')}"
+            node = nodes_by_id[node_id]
+            parent_id = None
+            try:
+                container_inode = item.get("containerInode")
+                if container_inode is not None and int(container_inode) != int(item.get("inode")):
+                    parent_id = directory_node_by_inode.get(int(container_inode))
+            except Exception:
+                parent_id = None
+            if parent_id and parent_id in nodes_by_id:
+                nodes_by_id[parent_id]["children"].append(node)
+            else:
+                roots.append(node)
+
+        def sort_nodes(nodes: list[dict[str, Any]]) -> None:
+            nodes.sort(key=lambda node: (
+                0 if node.get("fileType") == "directory" else 1,
+                str(node.get("name") or "").lower(),
+                int(node.get("inode") or 0),
+            ))
+            for node in nodes:
+                sort_nodes(node["children"])
+
+        sort_nodes(roots)
+        return {
+            "query": query_text,
+            "items": items,
+            "roots": roots,
+            "cursorBlock": directory_entries.get("cursorBlock", cursor_block),
+            "nextCursorBlock": directory_entries.get("nextCursorBlock"),
+            "scannedBlocks": directory_entries.get("scannedBlocks", 0),
+            "totalBlocks": directory_entries.get("totalBlocks", 0),
+            "truncated": directory_entries.get("truncated", False),
+            "capabilities": self.filesystem_capabilities(),
+            "notes": [],
+        }
+
     def file_dossier(self, inode: int | None = None, name: str = "",
                      offset: int | None = None,
                      cancel_token: str | None = None) -> dict[str, Any]:
@@ -1244,7 +1508,7 @@ class HexCorruptorSession:
             )
 
         lines = [
-            "# Отчёт HexCorruptor",
+            "# Отчёт ГРИФ",
             "",
             f"- Источник: `{self.path or 'неизвестно'}`",
             f"- Файловая система: `{self.parser.fs_name() if self.parser else 'неизвестно'}`",
@@ -1454,7 +1718,7 @@ class HexCorruptorSession:
             if platform.system() == "Darwin":
                 message = (
                     f"Недостаточно прав для чтения {source}. "
-                    "macOS обычно требует запуск HexCorruptor с правами администратора "
+                    "macOS обычно требует запуск ГРИФ с правами администратора "
                     "или отдельный privileged helper. Source не изменён."
                 )
             elif platform.system() == "Linux":
@@ -1502,7 +1766,7 @@ class HexCorruptorSession:
         Path(json_path).write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
         Path(md_path).write_text(
             "\n".join([
-                "# Снятие образа HexCorruptor",
+                "# Снятие образа ГРИФ",
                 "",
                 f"- Исходное устройство: `{log['source']}`",
                 f"- Новый образ: `{log['destination']}`",
@@ -1635,9 +1899,10 @@ def _create_demo_image() -> str:
     group_desc[8:12] = inode_table_block.to_bytes(4, "little")
     data[2048:2080] = group_desc
 
-    def put_inode(inode: int, mode: int, content: bytes, *, links: int, dtime: int = 0) -> None:
+    def put_inode(inode: int, mode: int, content: bytes, *, links: int, dtime: int = 0,
+                  data_block: int | None = None) -> None:
         inode_data = bytearray(inode_size)
-        data_block = 80 + inode
+        data_block = data_block if data_block is not None else 80 + inode
         now = 1772323200 + inode
         inode_data[0:2] = mode.to_bytes(2, "little")
         inode_data[4:8] = len(content).to_bytes(4, "little")
@@ -1683,6 +1948,7 @@ def _create_demo_image() -> str:
         start = block_number * block_size
         data[start:start + block_size] = block
 
+    put_inode(2, 0o040755, b"", links=2, data_block=96)
     put_inode(12, 0o100644, b"ACTIVE_DEMO_FILE", links=1)
     put_inode(
         13,
@@ -1692,7 +1958,7 @@ def _create_demo_image() -> str:
         dtime=1772326800,
     )
     put_inode(14, 0o040755, b"", links=2)
-    put_dir_block(96, 2, 2, [(18, "secret_folder", 2)])
+    put_dir_block(96, 2, 2, [(12, "active_demo.txt", 1), (18, "secret_folder", 2)])
     put_dir_block(97, 18, 2, [(19, "secret.txt", 1)])
     data[98 * block_size:98 * block_size + len(b"secret_text\n")] = b"secret_text\n"
     path.write_bytes(data)
@@ -1700,7 +1966,7 @@ def _create_demo_image() -> str:
 
 
 class ApiHandler(BaseHTTPRequestHandler):
-    server_version = "HexCorruptorWeb/0.1"
+    server_version = "GrifWeb/0.1"
 
     def do_OPTIONS(self) -> None:
         self._send_json({"ok": True})
@@ -1776,6 +2042,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                         query.get("to", [None])[0],
                         query.get("types", [""])[0],
                         _parse_int(query.get("limit", ["100"])[0], 100),
+                        cancel_token,
+                    )
+                )
+            elif method == "GET" and parsed.path == "/api/forensics/deleted-tree":
+                self._send_json(
+                    SESSION.deleted_trace_tree(
+                        query.get("query", [""])[0],
+                        _parse_int(query.get("limit", ["150"])[0], 150),
+                        _parse_int(query.get("cursor_block", ["0"])[0], 0),
+                        _parse_int(query.get("scan_blocks", ["50000"])[0], 50_000),
                         cancel_token,
                     )
                 )
@@ -1941,13 +2217,13 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="HexCorruptor web API bridge")
+    parser = argparse.ArgumentParser(description="ГРИФ web API bridge")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
     server = ThreadingHTTPServer((args.host, args.port), ApiHandler)
-    print(f"HexCorruptor API listening on http://{args.host}:{args.port}")
+    print(f"ГРИФ API listening on http://{args.host}:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

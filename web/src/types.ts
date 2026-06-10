@@ -16,10 +16,33 @@ export type SourceStatus = {
   canRedo: boolean;
   history: string[];
   capabilities: FilesystemCapability;
+  safety: SourceSafety;
+  imageIdentity: ImageIdentity | null;
+};
+
+export type ImageIdentity = {
+  key: string;
+  name: string;
+  path: string;
+  size: number;
+  sizeHuman: string;
+  isBlockDevice: boolean;
+  filesystem: string | null;
+  filesystemUuid: string | null;
+  openedAt: string;
+  metadataPath: string;
+  stat: {
+    device: number | null;
+    inode: number | null;
+    mode: number | null;
+    mtimeNs: number | null;
+    ctimeNs: number | null;
+  };
 };
 
 export type FilesystemCapability = {
   filesystem: string | null;
+  navigation: "full" | "partial" | "metadata";
   metadata: boolean;
   timeline: boolean;
   rawSearch: boolean;
@@ -27,6 +50,14 @@ export type FilesystemCapability = {
   directoryArtifacts: boolean;
   imaging: boolean;
   notes: string[];
+};
+
+export type SourceSafety = {
+  isDevicePath: boolean;
+  isLinuxDevice: boolean;
+  mountpoints: string[];
+  isMounted: boolean;
+  writeRequiresConfirmation: boolean;
 };
 
 export type HexRead = {
@@ -62,6 +93,12 @@ export type DirectoryEntry = {
   diskOffset: number;
   recordLength: number;
   isDirectory: boolean;
+  size: number | null;
+  sizeHuman: string | null;
+  mode: string | null;
+  links: number | null;
+  firstBlock: number | null;
+  firstBlockOffset: number | null;
 };
 
 export type DirectoryResponse = {
@@ -162,12 +199,16 @@ export type DirectoryArtifact = {
   recordLength: number;
   nameLength: number;
   diskOffset: number;
-  block: number;
-  blockOffset: number;
+  block: number | null;
+  blockOffset: number | null;
   containerInode: number | null;
   parentInode: number | null;
   evidence: string;
   confidence: string;
+  dataOffset?: number | null;
+  recoverability?: "full" | "partial" | null;
+  recoverableBytes?: number;
+  extentSummary?: string | null;
   inodeState: {
     state: "active" | "deleted" | "wiped" | "unreadable";
     mode: string | null;
@@ -183,6 +224,30 @@ export type DirectoryArtifact = {
   };
 };
 
+export type DeletedTraceNode = {
+  id: string;
+  name: string;
+  path: string;
+  inode: number;
+  fileType: string;
+  state: DirectoryArtifact["inodeState"]["state"];
+  item: DirectoryArtifact;
+  children: DeletedTraceNode[];
+};
+
+export type DeletedTraceTreeResponse = {
+  query: string;
+  items: DirectoryArtifact[];
+  roots: DeletedTraceNode[];
+  cursorBlock: number;
+  nextCursorBlock: number | null;
+  scannedBlocks: number;
+  totalBlocks: number;
+  truncated: boolean;
+  capabilities: FilesystemCapability;
+  notes: string[];
+};
+
 export type RawArtifact = {
   offset: number;
   length: number;
@@ -191,17 +256,19 @@ export type RawArtifact = {
   previewHex: string;
 };
 
+export type DirectoryArtifactsResponse = {
+  items: DirectoryArtifact[];
+  cursorBlock: number;
+  nextCursorBlock: number | null;
+  scannedBlocks: number;
+  totalBlocks: number;
+  truncated: boolean;
+  nameHint: string;
+};
+
 export type ForensicArtifactsResponse = {
   query: string;
-  directoryEntries: {
-    items: DirectoryArtifact[];
-    cursorBlock: number;
-    nextCursorBlock: number | null;
-    scannedBlocks: number;
-    totalBlocks: number;
-    truncated: boolean;
-    nameHint: string;
-  };
+  directoryEntries: DirectoryArtifactsResponse;
   rawMatches: {
     items: RawArtifact[];
     scannedBytes: number;
